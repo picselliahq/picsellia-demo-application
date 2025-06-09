@@ -47,6 +47,4 @@ Thumbs.db
 
 # Project specific
 captures/
-models/*.pt
-!models/yolov8n.pt  # Keep the base model
 uv.lock
