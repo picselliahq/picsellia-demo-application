@@ -1,0 +1,18 @@
+[project]
+name = "nashville"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "lap>=0.5.12",
+    "onnx>=1.18.0",
+    "opencv-python>=4.11.0.86",
+    "picsellia>=6.21.7",
+    "psutil>=7.0.0",
+    "pydantic-settings>=2.9.1",
+    "pyinstaller>=6.14.1",
+    "pyqt5>=5.15.11",
+    "pyqtgraph>=0.13.7",
+    "ultralytics>=8.3.150",
+]

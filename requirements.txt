@@ -1,0 +1,9 @@
+PyQt5==5.15.9
+opencv-python==4.8.0
+pydantic==2.5.2
+pydantic-settings==2.1.0
+python-dotenv==1.0.0
+picsellia==0.1.0
+ultralytics==8.1.2
+psutil==5.9.8
+pyqtgraph==0.13.3 
