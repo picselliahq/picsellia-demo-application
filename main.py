@@ -1,8 +1,9 @@
+import asyncio
 import base64
 import sys
 import cv2
 from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QComboBox, QInputDialog, QGridLayout, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsProxyWidget
-from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QRectF
+from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QRectF, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPainterPath, QBrush
 import datetime
 import os
@@ -16,7 +17,7 @@ import torch
 import uuid
 from PyQt5.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PyQt5.QtCore import QUrl
-
+import picsellia
 
 class PredictionGridView(QLabel):
     def __init__(self, parent=None):
@@ -157,6 +158,89 @@ class PredictionGridView(QLabel):
             label.setFixedSize(int(self.width() / 6), 200)
 
 
+class PredictionWorker(QThread):
+    finished = pyqtSignal(tuple)
+    error = pyqtSignal(str)
+
+    def __init__(self, deployment, frame, results):
+        super().__init__()
+        self.deployment = deployment
+        self.frame = frame
+        self.results = results
+
+    def run(self):
+        try:
+            detection_scores = []
+            detection_boxes = []
+            detection_classes = []
+            speed = 0
+            for result in self.results:
+                boxes = result.boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    conf = float(box.conf[0].cpu().numpy())
+                    cls = int(box.cls[0].cpu().numpy())
+                    detection_scores.append(conf)
+                    detection_boxes.append([y1, x1, y2, x2])
+                    detection_classes.append(cls)
+                speed += (result.speed['preprocess']+result.speed['inference']+result.speed['postprocess'])/1000
+
+            predictions = DetectionPredictionFormat(
+                detection_scores=detection_scores,
+                detection_boxes=detection_boxes,
+                detection_classes=detection_classes
+            )
+            now_timestamp = datetime.datetime.now().timestamp()
+            ret, jpeg = cv2.imencode('.jpg', self.frame)
+            if not ret:
+                self.error.emit("Error: Failed to encode frame to JPEG")
+                return
+
+            jpeg_bytes = jpeg.tobytes()
+            self.deployment.monitor_bytes(
+                raw_image=jpeg_bytes,
+                content_type="image/jpeg",
+                prediction=predictions,
+                filename=str(uuid.uuid4())+".jpg",
+                source="CVPR",
+                latency=speed,
+                timestamp=datetime.datetime.now().timestamp(),
+                height=self.frame.shape[0],
+                width=self.frame.shape[1],
+            )
+            self.finished.emit((predictions, now_timestamp))
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class PredictWorker(QThread):
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, deployment_latent: picsellia.Deployment, frame):
+        super().__init__()
+        self.deployment_latent = deployment_latent
+        self.frame = frame
+        
+    def run(self):
+        try:
+            ret, jpeg = cv2.imencode('.jpg', self.frame)
+            if not ret:
+                self.error.emit("Error: Failed to encode frame to JPEG")
+                return
+
+            jpeg_bytes = jpeg.tobytes()
+            prediction = self.deployment_latent.predict_bytes(
+                raw_image=jpeg_bytes,
+                filename=str(uuid.uuid4())+".jpg",
+                tags="ATTENDANCE-MONITORING"
+            )
+            self.finished.emit(prediction)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class CameraApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -190,6 +274,7 @@ class CameraApp(QMainWindow):
         self.position_elements()
         self.start_camera_timer()
         self.start_prediction_refresh_timer()
+        self.start_auto_predict_timer()
 
     # --- UI SETUP ---
     def setup_ui(self):
@@ -289,6 +374,7 @@ class CameraApp(QMainWindow):
         self.button_layout = QHBoxLayout(self.button_container)
         self.button_layout.setContentsMargins(0, 0, 0, 0)
         self.button_layout.setSpacing(10)
+
         self.predict_button = QPushButton("Send prediction to picsellia", self.button_container)
         self.predict_button.setFixedSize(250, 30)
         self.predict_button.setStyleSheet("""
@@ -309,6 +395,7 @@ class CameraApp(QMainWindow):
         """)
         self.predict_button.clicked.connect(self.predict_frame)
         self.button_layout.addWidget(self.predict_button)
+
         self.stop_button = QPushButton("Stop", self.central_widget)
         self.stop_button.setFixedSize(80, 30)
         self.stop_button.setStyleSheet("""
@@ -361,6 +448,7 @@ class CameraApp(QMainWindow):
         try:
             self.client = Client(api_token=config.PICSELLIA_TOKEN, organization_id=config.PICSELLIA_ORGANIZATION)
             self.deployment = None
+            self.deployment_latent = self.client.get_deployment_by_id('01976966-d67c-7b71-bf3b-65b9f2c0a177')
         except Exception as e:
             print("WARNING: not logged", str(e))
             self.client = None
@@ -491,7 +579,8 @@ class CameraApp(QMainWindow):
             self.class_colors[class_name] = (int(b * 255), int(g * 255), int(r * 255))
         return self.class_colors[class_name]
 
-    def monitor_predictions(self, frame, results):
+    # def monitor_predictions(self, frame, results):
+    async def monitor_predictions(self, frame, results):
         if not results or not self.deployment:
             return None
         try:
@@ -532,7 +621,6 @@ class CameraApp(QMainWindow):
                 height=frame.shape[0],
                 width=frame.shape[1],
             )
-            print(f"Monitoring {len(detection_classes)} predictions")
             return predictions, now_timestamp
         except Exception as e:
             print(f"Monitoring Error: {str(e)}")
@@ -542,31 +630,26 @@ class CameraApp(QMainWindow):
         if not self.model or self.current_predictions is None or self.current_frame is None:
             print("Error: No predictions to monitor")
             return
-        print("State: Thinking...")
         try:
             if self.client and self.deployment:
-                monitored_data = self.monitor_predictions(self.current_frame, self.current_predictions)
-                if monitored_data:
-                    predictions, timestamp = monitored_data
-                    # TODO: Send predictions to Picsellia
-                    print("Predictions monitored")
+                # Create and start the worker thread
+                self.worker = PredictionWorker(
+                    self.deployment,
+                    self.current_frame.copy(),
+                    self.current_predictions
+                )
+                self.worker.finished.connect(self.handle_prediction_finished)
+                self.worker.error.connect(self.handle_prediction_error)
+                self.worker.start()
         except Exception as e:
             print(f"Prediction Error: {str(e)}")
-        detections = []
-        for result in self.current_predictions:
-            boxes = result.boxes
-            for box in boxes:
-                cls = int(box.cls[0].cpu().numpy())
-                conf = float(box.conf[0].cpu().numpy())
-                class_name = result.names[cls]
-                detections.append(f"{class_name} - confidence: {conf:.2f}")
-        
-        if detections:
-            print("Detections:")
-            for det in detections:
-                print(det)
-        else:
-            print("No objects detected")
+
+    def handle_prediction_finished(self, result):
+        predictions, timestamp = result
+        # Update UI or perform any necessary actions with the results
+
+    def handle_prediction_error(self, error_msg):
+        print(f"Prediction Error: {error_msg}")
 
     def update_confidence_threshold(self, value):
         self.confidence_threshold = value / 100.0
@@ -585,9 +668,38 @@ class CameraApp(QMainWindow):
             except Exception as e:
                 print(f"Error refreshing predictions: {str(e)}")
 
+    def start_auto_predict_timer(self):
+        self.auto_predict_timer = QTimer()
+        self.auto_predict_timer.timeout.connect(self.auto_predict)
+        self.auto_predict_timer.start(5000)  # 5000ms = 5 seconds
+
+    def auto_predict(self):
+        if not self.deployment or self.current_frame is None:
+            return
+
+        self.predict_worker = PredictWorker(self.deployment_latent, self.current_frame.copy())
+        self.predict_worker.finished.connect(self.handle_predict_finished)
+        self.predict_worker.error.connect(self.handle_predict_error)
+        self.predict_worker.start()
+
+    def handle_predict_finished(self, prediction):
+        # Handle the prediction result here
+        print("Prediction received:", prediction)
+
+    def handle_predict_error(self, error_msg):
+        print(f"Prediction Error: {error_msg}")
+
     def closeEvent(self, event):
         if hasattr(self, 'prediction_timer'):
             self.prediction_timer.stop()
+        if hasattr(self, 'auto_predict_timer'):
+            self.auto_predict_timer.stop()
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait()
+        if hasattr(self, 'predict_worker') and self.predict_worker.isRunning():
+            self.predict_worker.terminate()
+            self.predict_worker.wait()
         self.camera.release()
         event.accept()
 
