@@ -241,6 +241,66 @@ class PredictWorker(QThread):
             self.error.emit(str(e))
 
 
+class VideoFileWorker(QThread):
+    frame_processed = pyqtSignal(QPixmap)
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, model, yolo_device, file_path, draw_detections_func, graphics_view_width, graphics_view_height):
+        super().__init__()
+        self.model = model
+        self.yolo_device = yolo_device
+        self.file_path = file_path
+        self.draw_detections_func = draw_detections_func
+        self.graphics_view_width = graphics_view_width
+        self.graphics_view_height = graphics_view_height
+        self._is_running = True
+
+    def run(self):
+        cap = cv2.VideoCapture(self.file_path)
+        if not cap.isOpened():
+            self.error.emit("Error: Could not open video file.")
+            return
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        delay = int(1000 / fps) if fps > 0 else 30
+        while self._is_running and cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if self.model:
+                try:
+                    results = self.model.track(frame, persist=True, device=self.yolo_device, verbose=False)
+                    if results and hasattr(results[0], 'boxes'):
+                        # Print details for each detection
+                        for result in results:
+                            if hasattr(result, 'boxes'):
+                                for box in result.boxes:
+                                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                                    conf = float(box.conf[0].cpu().numpy())
+                                    cls = int(box.cls[0].cpu().numpy())
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame = self.draw_detections_func(frame.copy(), results)
+                except Exception as e:
+                    self.error.emit(f"Prediction Error: {str(e)}")
+                    continue
+            h, w, ch = frame.shape
+            bytes_per_line = ch * w
+            qt_image = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qt_image)
+            scaled_pixmap = pixmap.scaled(
+                self.graphics_view_width, self.graphics_view_height,
+                Qt.IgnoreAspectRatio,
+                Qt.SmoothTransformation
+            )
+            self.frame_processed.emit(scaled_pixmap)
+            QThread.msleep(delay)
+        cap.release()
+        self.finished.emit()
+
+    def stop(self):
+        self._is_running = False
+
+
 class CameraApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -341,7 +401,6 @@ class CameraApp(QMainWindow):
         if not self.available_models:
             self.model_dropdown.addItem("No models found", None)
             self.model_dropdown.setEnabled(False)
-            print("Warning: No YOLO models found in 'models/' directory.")
         else:
             for model_path in self.available_models:
                 model_name = os.path.basename(model_path)
@@ -396,6 +455,27 @@ class CameraApp(QMainWindow):
         self.predict_button.clicked.connect(self.predict_frame)
         self.button_layout.addWidget(self.predict_button)
 
+        self.run_video_button = QPushButton("Run model on video", self.button_container)
+        self.run_video_button.setFixedSize(200, 30)
+        self.run_video_button.setStyleSheet("""
+            QPushButton {
+                background-color: #80C1FF;
+                color: white;
+                border: none;
+                border-radius: 10px;
+                font-size: 14px;
+                font-weight: normal;
+            }
+            QPushButton:hover {
+                background-color: #AEE6FF;
+            }
+            QPushButton:pressed {
+                background-color: #AEE6FF;
+            }
+        """)
+        self.run_video_button.clicked.connect(self.run_model_on_video)
+        self.button_layout.addWidget(self.run_video_button)
+
         self.stop_button = QPushButton("Stop", self.central_widget)
         self.stop_button.setFixedSize(80, 30)
         self.stop_button.setStyleSheet("""
@@ -414,7 +494,7 @@ class CameraApp(QMainWindow):
                 background-color: #CC3333;
             }
         """)
-        self.stop_button.clicked.connect(self.close)
+        self.stop_button.clicked.connect(self.stop_all_processes)
 
     # --- MODEL & INTEGRATION SETUP ---
     def get_yolo_device(self):
@@ -439,7 +519,7 @@ class CameraApp(QMainWindow):
         try:
             self.model = YOLO(model_path)
             self.model.to(self.yolo_device)
-            self.deployment = self.client.get_deployment_by_id(self.deployment_id_map[model_path.split('/')[-1]])
+            self.deployment = None #self.self.client.get_deployment_by_id(self.deployment_id_map[model_path.split('/')[-1]])
         except Exception as e:
             self.model = None
 
@@ -689,7 +769,56 @@ class CameraApp(QMainWindow):
     def handle_predict_error(self, error_msg):
         print(f"Prediction Error: {error_msg}")
 
-    def closeEvent(self, event):
+    def run_model_on_video(self):
+        from PyQt5.QtWidgets import QFileDialog
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Video File", "", "Video Files (*.mp4 *.avi *.mov)")
+        if not file_path:
+            return
+        self.start_video_file_worker(file_path)
+
+    def start_video_file_worker(self, file_path):
+        # Stop any existing video file worker
+        if hasattr(self, 'video_file_worker') and self.video_file_worker.isRunning():
+            self.video_file_worker.stop()
+            self.video_file_worker.wait()
+        # Stop the camera feed while processing video file
+        if hasattr(self, 'timer') and self.timer.isActive():
+            self.timer.stop()
+        self.video_file_worker = VideoFileWorker(
+            self.model,
+            self.yolo_device,
+            file_path,
+            self.draw_detections,
+            self.graphics_view.width(),
+            self.graphics_view.height()
+        )
+        self.video_file_worker.frame_processed.connect(self.display_video_frame)
+        self.video_file_worker.finished.connect(self.handle_video_file_finished)
+        self.video_file_worker.error.connect(self.handle_video_file_error)
+        self.video_file_worker.start()
+        self.is_processing_video_file = True
+
+    def display_video_frame(self, pixmap):
+        self.video_item.setPixmap(pixmap)
+        QApplication.processEvents()
+
+    def handle_video_file_finished(self):
+        self.is_processing_video_file = False
+        print("Video file processing finished.")
+        # Restart the camera feed after video file processing is done
+        if hasattr(self, 'timer') and not self.timer.isActive():
+            self.timer.start(30)
+
+    def handle_video_file_error(self, error_msg):
+        print(f"Video File Error: {error_msg}")
+        self.is_processing_video_file = False
+
+    def stop_all_processes(self):
+        # Stop video file worker if running
+        if hasattr(self, 'video_file_worker') and self.video_file_worker.isRunning():
+            self.video_file_worker.stop()
+            self.video_file_worker.wait()
+        # Stop prediction and auto_predict workers as before
         if hasattr(self, 'prediction_timer'):
             self.prediction_timer.stop()
         if hasattr(self, 'auto_predict_timer'):
@@ -700,7 +829,12 @@ class CameraApp(QMainWindow):
         if hasattr(self, 'predict_worker') and self.predict_worker.isRunning():
             self.predict_worker.terminate()
             self.predict_worker.wait()
-        self.camera.release()
+        if hasattr(self, 'camera'):
+            self.camera.release()
+        print("All processes stopped.")
+
+    def closeEvent(self, event):
+        self.stop_all_processes()
         event.accept()
 
     # --- UI POSITIONING ---
@@ -734,7 +868,7 @@ class CameraApp(QMainWindow):
         self.stop_button.move(stop_x, stop_y)
 
         # Button container to the left of stop button
-        button_container_width = self.predict_button.width()
+        button_container_width = self.predict_button.width() + self.run_video_button.width() + self.button_layout.spacing()
         button_container_height = self.predict_button.height()
         button_container_x = stop_x - button_container_width - 20
         button_container_y = stop_y

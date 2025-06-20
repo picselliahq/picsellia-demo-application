@@ -48,3 +48,7 @@ Thumbs.db
 # Project specific
 captures/
 uv.lock
+
+*.mp4 
+
+models/*
